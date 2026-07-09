@@ -1,0 +1,264 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# INSTANA AGENT — DaemonSet
+# ──────────────────────────────────────────────────────────────────────────────
+# Runs one Instana agent pod on every K8s node.
+# Auto-discovers: pods, containers, processes, Node.js runtimes, PostgreSQL,
+# nginx, K8s events (OOMKill, CrashLoopBackOff, etc.)
+#
+# Prerequisites:
+#   1. Create the instana-agent namespace:
+#      kubectl create namespace instana-agent
+#   2. Fill in INSTANA_AGENT_KEY and INSTANA_DOWNLOAD_KEY below
+#      (get them from Settings > Agents in your Instana tenant)
+#   3. Set INSTANA_AGENT_ENDPOINT_HOST to your SaaS endpoint, e.g.:
+#      ingress-orange-saas.instana.io
+#
+# Deploy:
+#   kubectl apply -f k8s/instana/agent-daemonset.yaml
+# ══════════════════════════════════════════════════════════════════════════════
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: instana-agent
+  labels:
+    app.kubernetes.io/name: instana-agent
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: instana-agent
+  namespace: instana-agent
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: instana-agent
+rules:
+  - apiGroups: [""]
+    resources:
+      - componentstatuses
+      - endpoints
+      - events
+      - namespaces
+      - nodes
+      - nodes/metrics
+      - nodes/proxy
+      - nodes/stats
+      - persistentvolumeclaims
+      - persistentvolumes
+      - pods
+      - pods/log
+      - replicationcontrollers
+      - resourcequotas
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - daemonsets
+      - deployments
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions"]
+    resources: ["deployments", "ingresses", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/healthz", "/metrics", "/version"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: instana-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: instana-agent
+subjects:
+  - kind: ServiceAccount
+    name: instana-agent
+    namespace: instana-agent
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: instana-agent-secret
+  namespace: instana-agent
+type: Opaque
+stringData:
+  # ── FILL THESE IN ──────────────────────────────────────────────────────────
+  agent-key: "REPLACE_WITH_YOUR_INSTANA_AGENT_KEY"
+  download-key: "REPLACE_WITH_YOUR_INSTANA_DOWNLOAD_KEY"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: instana-agent-config
+  namespace: instana-agent
+data:
+  configuration.yaml: |
+    # Instana agent configuration
+    com.instana.plugin.kubernetes:
+      enabled: true
+
+    com.instana.plugin.postgresql:
+      enabled: true
+      poll_rate: 10
+      databases:
+        - host: postgres.banking-demo.svc.cluster.local
+          port: 5432
+          user: bankadmin
+          password: bankpass123
+          dbname: demobankingdb
+          collect_blockers: true
+
+    com.instana.plugin.nodejs:
+      enabled: true
+
+    com.instana.plugin.process:
+      enabled: true
+
+    # Alert on these K8s events
+    com.instana.plugin.k8s-events:
+      enabled: true
+      watch:
+        - OOMKilling
+        - BackOff
+        - Failed
+        - Killing
+        - Evicted
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: instana-agent
+  namespace: instana-agent
+  labels:
+    app: instana-agent
+spec:
+  selector:
+    matchLabels:
+      app: instana-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: instana-agent
+    spec:
+      serviceAccountName: instana-agent
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: instana-agent
+          image: icr.io/instana/agent:latest
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          env:
+            - name: INSTANA_AGENT_ENDPOINT_HOST
+              # SaaS example: ingress-orange-saas.instana.io
+              # On-prem example: your-instana-backend.internal
+              value: "REPLACE_WITH_YOUR_INSTANA_ENDPOINT"
+            - name: INSTANA_AGENT_ENDPOINT_PORT
+              value: "443"
+            - name: INSTANA_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: instana-agent-secret
+                  key: agent-key
+            - name: INSTANA_DOWNLOAD_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: instana-agent-secret
+                  key: download-key
+            - name: INSTANA_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INSTANA_KUBERNETES_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: INSTANA_KUBERNETES_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: INSTANA_KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 750m
+              memory: 768Mi
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+            - name: var-run
+              mountPath: /var/run
+            - name: run
+              mountPath: /run
+            - name: host-fs
+              mountPath: /host
+              readOnly: true
+            - name: configuration
+              mountPath: /root/configuration.yaml
+              subPath: configuration.yaml
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: 42699
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          ports:
+            - containerPort: 42699
+              hostPort: 42699
+              protocol: TCP
+              name: agent-api
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: var-run
+          hostPath:
+            path: /var/run
+        - name: run
+          hostPath:
+            path: /run
+        - name: host-fs
+          hostPath:
+            path: /
+        - name: configuration
+          configMap:
+            name: instana-agent-config

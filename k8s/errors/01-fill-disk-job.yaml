@@ -1,0 +1,90 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 1 — DB DISK FULL
+# ──────────────────────────────────────────────────────────────────────────────
+# What happens:
+#   This Job connects directly to PostgreSQL and writes 8KB blobs in a tight
+#   loop until the 512Mi PVC is exhausted.
+#
+# Chain of failures:
+#   PostgreSQL  → "could not write to file: No space left on device" (SQLSTATE 58P01)
+#   Backend     → Prisma throws P2024 / PrismaClientKnownRequestError
+#                 → all write endpoints return HTTP 503
+#   Frontend    → transfers fail, "Service Unavailable" banner
+#
+# Observable in Instana:
+#   • DB: disk utilization 100%, write IOPS drop to zero
+#   • Backend: error rate spike, 503 responses, slow/timed-out requests
+#   • K8s: postgres pod readiness probe fails → pod NotReady
+#
+# Apply:   kubectl apply -f k8s/errors/01-fill-disk-job.yaml
+# Cleanup: kubectl delete job fill-disk-job -n banking-demo
+#          kubectl exec -n banking-demo postgres-0 -- psql -U bankadmin -d demobankingdb -c "DELETE FROM chaos_filler;"
+#          kubectl exec -n banking-demo postgres-0 -- psql -U bankadmin -d demobankingdb -c "VACUUM FULL;"
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fill-disk-job
+  namespace: banking-demo
+  labels:
+    scenario: disk-full
+    tier: chaos
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        scenario: disk-full
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fill-disk
+          image: postgres:15-alpine
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: POSTGRES_PASSWORD
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "════════════════════════════════════════"
+              echo "SCENARIO 1: DB Disk Fill"
+              echo "Target: postgres:5432/demobankingdb"
+              echo "Writing 8KB blobs until PVC is exhausted..."
+              echo "════════════════════════════════════════"
+
+              psql -h postgres -U bankadmin -d demobankingdb <<'SQL'
+                -- Create filler table (outside app schema to keep it clean)
+                CREATE TABLE IF NOT EXISTS chaos_filler (
+                  id SERIAL PRIMARY KEY,
+                  payload TEXT,
+                  created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                -- Write in a loop until we hit "no space left on device"
+                DO $$
+                DECLARE
+                  i        INTEGER := 0;
+                  chunk    TEXT    := repeat('BANKDEMO_CHAOS_FILLER_', 372);  -- ~8 KB
+                  rows_per_commit INTEGER := 100;
+                BEGIN
+                  LOOP
+                    i := i + 1;
+                    INSERT INTO chaos_filler (payload) VALUES (chunk);
+
+                    IF MOD(i, rows_per_commit) = 0 THEN
+                      RAISE NOTICE 'fill-disk: % rows written (~% MB used)', i, (i * 8 / 1024);
+                    END IF;
+                  END LOOP;
+                EXCEPTION WHEN OTHERS THEN
+                  RAISE NOTICE '══ DISK FULL at row % ══', i;
+                  RAISE NOTICE 'SQLSTATE: %  MESSAGE: %', SQLSTATE, SQLERRM;
+                END;
+                $$;
+              SQL
+
+              echo "Job complete. PostgreSQL should now be reporting disk errors."
+              echo "Check: kubectl logs -n banking-demo -l app=backend --tail=50"

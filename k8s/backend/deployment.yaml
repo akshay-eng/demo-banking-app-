@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: banking-demo
+  labels:
+    app: backend
+    tier: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        tier: api
+      annotations:
+        # Instana Node.js auto-instrumentation
+        instana.io/service-name: "banking-backend"
+        instana.io/custom-tags: "tier=api,env=demo,app=banking"
+        # Prometheus scrape (if using Prometheus adapter with Instana)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: backend
+          # Build: docker build -t demobanking-backend ./backend
+          # Push:  docker tag demobanking-backend <registry>/demobanking-backend:latest
+          image: demobanking-backend:latest
+          imagePullPolicy: IfNotPresent   # use Never for local minikube
+          ports:
+            - containerPort: 4000
+              name: http
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: JWT_SECRET
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: BACKEND_PORT
+            - name: NODE_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: NODE_ENV
+            - name: FRONTEND_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: FRONTEND_URL
+            # DB connection pool — keep low so Scenario B (pool exhaustion) triggers easily
+            - name: DB_CONNECTION_LIMIT
+              value: "5"
+            # Instana collector config (auto-detected from INSTANA_* env vars)
+            - name: INSTANA_AGENT_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP   # points to node-local Instana agent
+            - name: INSTANA_AGENT_PORT
+              value: "42699"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+      # Wait for Postgres to be up before starting
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until pg_isready -h postgres -U bankadmin -d demobankingdb; do
+                echo "Waiting for postgres..."; sleep 3;
+              done
+              echo "Postgres is ready."
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: POSTGRES_PASSWORD

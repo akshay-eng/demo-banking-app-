@@ -1,0 +1,60 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 4 — DATABASE UNAVAILABLE (scale to 0)
+# ──────────────────────────────────────────────────────────────────────────────
+# What happens:
+#   Scales the postgres StatefulSet to 0 replicas. Backend loses its DB
+#   connection immediately. All database-backed endpoints return 503.
+#
+# Chain of failures:
+#   PostgreSQL   → pod terminated; DNS still resolves but connection refused
+#   Backend      → Prisma: "Can't reach database server at 'postgres:5432'" (P1001)
+#                → /health returns HTTP 503 {"status":"degraded","db":"unavailable"}
+#                → all /api/* endpoints return 503
+#   Frontend     → login fails, account page blank, transfer fails
+#                → persistent 503 banners
+#
+# Observable in Instana:
+#   • K8s: postgres pod count = 0; StatefulSet unhealthy
+#   • Backend: /health probe starts failing → readiness probe fails
+#              → backend pods removed from Service endpoints
+#   • Frontend: 100% error rate
+#   • Instana alert: "Service banking-postgres down"
+#
+# Apply (kills DB):
+#   kubectl apply -f k8s/errors/04-kill-db.yaml
+# Restore:
+#   kubectl scale statefulset postgres --replicas=1 -n banking-demo
+#   # then wait for backend pods to pass readiness probe
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: banking-demo
+  labels:
+    app: postgres
+    chaos-scenario: db-killed
+spec:
+  serviceName: postgres
+  replicas: 0   # ← KILL IT
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_DB
+              value: demobankingdb
+            - name: POSTGRES_USER
+              value: bankadmin
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: POSTGRES_PASSWORD

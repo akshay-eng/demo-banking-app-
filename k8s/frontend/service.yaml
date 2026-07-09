@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: banking-demo
+  labels:
+    app: frontend
+    tier: web
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+      name: http
+    - port: 3000
+      targetPort: 80
+      protocol: TCP
+      name: http-alt
+  # NodePort so you can reach it from outside the cluster during demo
+  type: NodePort
+  # NodePort will be auto-assigned (30000–32767) or pin it:
+  # nodePort: 30080

@@ -1,0 +1,88 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 3 — BACKEND OOM KILL → CRASHLOOPBACKOFF
+# ──────────────────────────────────────────────────────────────────────────────
+# What happens:
+#   Patches the backend deployment with a 96Mi memory limit (Node.js + Prisma
+#   needs ~200MB baseline), then triggers /api/chaos/oom which allocates 50MB
+#   chunks until K8s OOMKills the pod. K8s restarts it → same thing repeats
+#   → CrashLoopBackOff.
+#
+# Chain of failures:
+#   Backend pod  → OOMKilled (exit 137)
+#   K8s          → pod restarts → CrashLoopBackOff
+#   Frontend     → nginx gets 502 Bad Gateway (no backend upstream)
+#                → login page shows "Service Unavailable"
+#
+# Observable in Instana:
+#   • K8s: pod restart count spikes, OOMKilled events
+#   • Backend: service becomes unavailable (no healthy pods)
+#   • Frontend: HTTP 502 errors from nginx proxy
+#   • Instana alert: "CrashLoopBackOff detected on banking-backend"
+#
+# Step 1 — Apply tight memory limit:
+#   kubectl apply -f k8s/errors/03-backend-oom.yaml
+# Step 2 — Trigger OOM via chaos endpoint:
+#   kubectl port-forward svc/backend 4000:4000 -n banking-demo
+#   curl -X POST http://localhost:4000/api/chaos/oom
+# Step 3 — Watch the crash loop:
+#   kubectl get pods -n banking-demo -w
+# Cleanup — restore normal limits:
+#   kubectl apply -f k8s/backend/deployment.yaml
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: banking-demo
+  labels:
+    app: backend
+    tier: api
+    chaos-scenario: oom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        tier: api
+      annotations:
+        instana.io/service-name: "banking-backend"
+        instana.io/custom-tags: "tier=api,env=demo,chaos=oom"
+    spec:
+      containers:
+        - name: backend
+          image: demobanking-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: JWT_SECRET
+            - name: PORT
+              value: "4000"
+            - name: NODE_ENV
+              value: production
+            - name: INSTANA_AGENT_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: INSTANA_AGENT_PORT
+              value: "42699"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 96Mi
+            limits:
+              cpu: 300m
+              memory: 96Mi   # ← Deliberately too low — OOMKill guaranteed

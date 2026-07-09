@@ -1,0 +1,64 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 2 — CONNECTION POOL EXHAUSTION
+# ──────────────────────────────────────────────────────────────────────────────
+# What happens:
+#   10 parallel workers each fire 10 concurrent transfer requests.
+#   The backend DB_CONNECTION_LIMIT=5 means pool is exhausted almost immediately.
+#
+# Chain of failures:
+#   Backend pool → Prisma: "Timed out fetching connection from pool" (P2024)
+#                       → HTTP 503 "connection pool timeout"
+#   PostgreSQL   → "too many clients" (SQLSTATE 53300) if limit exceeded
+#   Frontend     → transfers/account loads fail with 503 banners
+#
+# Observable in Instana:
+#   • Backend: P95 latency spike (requests queue behind pool wait)
+#   • Backend: error rate → 100% on /api/transactions and /api/accounts
+#   • DB: connection count graph hits ceiling; query queue depth spikes
+#
+# Apply:   kubectl apply -f k8s/errors/02-load-spike-job.yaml
+# Cleanup: kubectl delete job load-spike-job -n banking-demo
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-spike-job
+  namespace: banking-demo
+  labels:
+    scenario: pool-exhaustion
+    tier: chaos
+spec:
+  parallelism: 10       # 10 concurrent workers
+  completions: 10
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        scenario: pool-exhaustion
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load-gen
+          image: curlimages/curl:8.5.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "SCENARIO 2: Load spike — pool exhaustion"
+              echo "Firing 60 concurrent requests to backend:4000..."
+
+              # First, trigger the server-side pool hold via chaos endpoint
+              curl -s -X POST http://backend:4000/api/chaos/exhaust-pool \
+                -H "Content-Type: application/json" \
+                -d '{"seconds": 30}' &
+
+              # Simultaneously hammer the transfer endpoint
+              for i in $(seq 1 60); do
+                curl -s -X POST http://backend:4000/api/chaos/transfer-stress \
+                  -H "Content-Type: application/json" \
+                  -d '{}' \
+                  -o /dev/null \
+                  -w "[$i] HTTP %{http_code} — %{time_total}s\n" &
+              done
+              wait
+              echo "Load spike done. Check backend logs and Instana error rate."

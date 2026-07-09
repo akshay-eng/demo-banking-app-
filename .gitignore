@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Build output
+dist/
+*/dist/
+build/
+*/build/
+
+# Environment files — never commit real credentials
+.env
+.env.local
+.env.*.local
+backend/.env
+
+# Logs
+*.log
+logs/
+backend.log
+frontend.log
+
+# Prisma generated client
+backend/src/generated/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+
+# Docker
+.dockerignore

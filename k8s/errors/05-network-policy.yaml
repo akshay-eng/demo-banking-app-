@@ -1,0 +1,40 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 5 — NETWORK PARTITION (backend cannot reach DB)
+# ──────────────────────────────────────────────────────────────────────────────
+# What happens:
+#   Applies a NetworkPolicy that blocks all ingress to the postgres pod.
+#   The DB pod is Running and healthy, but the backend cannot reach it.
+#   This simulates a network-level failure (broken CNI route, firewall rule, etc.)
+#
+# Chain of failures:
+#   Network      → TCP connections from backend to postgres:5432 are dropped
+#   Backend      → connection timeout after ~5s → Prisma P1001
+#                → HTTP 503 on all DB-backed endpoints
+#   Frontend     → same as Scenario 4 (503 everywhere)
+#   BUT:         → postgres pod itself appears healthy in K8s (Running + Ready)
+#                → only Instana's connection-level tracing reveals the broken path
+#
+# Observable in Instana:
+#   • Backend: outbound connection timeouts to postgres (TCP timeout, not refused)
+#   • Unusual: postgres pod green in K8s, yet backend DB call latency → ∞
+#   • This is the hardest scenario to diagnose without distributed tracing
+#
+# Apply:   kubectl apply -f k8s/errors/05-network-policy.yaml
+# Cleanup: kubectl delete networkpolicy block-postgres-ingress -n banking-demo
+#
+# Requires: CNI with NetworkPolicy support (Calico, Cilium, Weave — NOT Flannel default)
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-postgres-ingress
+  namespace: banking-demo
+  labels:
+    chaos-scenario: network-partition
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress: []   # Empty = no ingress allowed from anyone (including backend)

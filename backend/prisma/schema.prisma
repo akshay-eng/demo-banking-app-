@@ -1,0 +1,68 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  firstName String
+  lastName  String
+  phone     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts Account[]
+}
+
+model Account {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountNumber String   @unique
+  type          String   @default("CHECKING")
+  balance       Float    @default(0)
+  currency      String   @default("USD")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  cards                Card[]
+  sentTransactions     Transaction[] @relation("SentTransactions")
+  receivedTransactions Transaction[] @relation("ReceivedTransactions")
+}
+
+model Card {
+  id         String   @id @default(uuid())
+  accountId  String
+  account    Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  cardNumber String   @unique
+  cardHolder String
+  expiryDate String
+  cvv        String
+  type       String   @default("DEBIT")
+  status     String   @default("ACTIVE")
+  limit      Float?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Transaction {
+  id            String   @id @default(uuid())
+  fromAccountId String?
+  fromAccount   Account? @relation("SentTransactions", fields: [fromAccountId], references: [id])
+  toAccountId   String?
+  toAccount     Account? @relation("ReceivedTransactions", fields: [toAccountId], references: [id])
+  amount        Float
+  currency      String   @default("USD")
+  type          String
+  description   String?  @db.VarChar(500)
+  status        String   @default("COMPLETED")
+  category      String?
+  merchant      String?
+  createdAt     DateTime @default(now())
+}
