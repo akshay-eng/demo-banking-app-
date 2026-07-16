@@ -20,8 +20,11 @@ logs/
 backend.log
 frontend.log
 
-# Prisma generated client
+# Prisma generated client and dev databases
 backend/src/generated/
+*.db
+*.db-journal
+*.sqlite
 
 # OS / editor
 .DS_Store

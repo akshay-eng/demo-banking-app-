@@ -1,6 +1,24 @@
 <!DOCTYPE html>
 <html lang="en">
   <head>
+    <!--
+      Instana EUM (End User Monitoring) goes here — must stay the FIRST thing
+      in <head>, before any other resource, so it can time the full page load.
+
+      This block is intentionally left as instructions, not guessed code:
+      the bootstrap snippet's exact syntax and CDN path can vary by Instana
+      version/tenant, and getting it subtly wrong fails silently (no traffic,
+      no error). Get the real snippet from:
+
+        Instana → Websites & Mobile Apps → New Website
+        → name it "DemoBank Frontend" → copy the generated snippet exactly
+        → paste it in place of this comment block
+
+      It'll look like a small <script> defining an `ineum(...)` queue plus a
+      <script src="https://eum.instana.io/eum.min.js"> tag — paste both parts
+      verbatim, don't retype the key or reporting URL by hand.
+    -->
+
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -12,5 +30,15 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+  (function(s,t,a,n){s[t]||(s[t]=a,n=s[a]=function(){n.q.push(arguments)},
+  n.q=[],n.v=2,n.l=1*new Date)})(window,"InstanaEumObject","ineum");
+
+  ineum('reportingUrl', 'https://eum-orange-saas.instana.io');
+  ineum('key', 'OR6xUtCHQ3C7IvsGHcsitA');
+  ineum('trackSessions');
+</script>
+<script defer crossorigin="anonymous" src="https://eum.instana.io/1.8.1/eum.min.js" 
+ integrity="sha384-qFzHZ5BC7HOPEBSYkbYSv+DBWrG34P1QW9mIaCR41db6yOJNYmH4antW6KLkc6v1"></script>
   </body>
 </html>
