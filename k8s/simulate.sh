@@ -17,9 +17,19 @@ pf() {
 
 cleanup_pf() {
   [ -n "$PF_PID" ] && kill $PF_PID 2>/dev/null
+  [ -n "$PF_FE_PID" ] && kill $PF_FE_PID 2>/dev/null
 }
 
 trap cleanup_pf EXIT
+
+# Port-forward the frontend Service (nginx) — separate from pf() above, which
+# talks to the backend directly and bypasses nginx entirely.
+pf_frontend() {
+  kubectl port-forward -n $NS svc/frontend 8080:80 &>/dev/null &
+  PF_FE_PID=$!
+  sleep 2
+  echo "Frontend port-forward active (PID $PF_FE_PID)"
+}
 
 header() {
   echo ""
@@ -196,6 +206,100 @@ scenario_network_partition() {
   echo "  kubectl delete networkpolicy block-postgres-ingress -n $NS"
 }
 
+# ── SCENARIO 6: Full Cascade — DB crash → backend log errors → frontend errors ─
+# One command, whole chain, hit through the real frontend Service (not a
+# backend port-forward) so nginx's actual proxy path gets exercised.
+#
+# Expected Instana alerts:
+#   ▸ Kubernetes: postgres StatefulSet not-ready / restart event
+#   ▸ Application: banking-backend error rate + call-volume drop
+#   ▸ Backend pod logs: Prisma connection errors (real, not simulated)
+#
+# Known nuance, not a script bug: authenticated calls during the outage come
+# back 401 "Invalid or expired token," not 500/503. The auth middleware's
+# catch block treats a DB failure the same as a bad token — so that 401 IS
+# the DB outage, just mislabeled. Watch the backend logs (tailed below) to
+# see the real Prisma error underneath it.
+CHAOS_USER_EMAIL="chaos-demo@example.com"
+CHAOS_USER_PASS="ChaosDemo123!"
+
+scenario_cascade() {
+  header "SCENARIO 6: FULL CASCADE — DB → BACKEND LOGS → FRONTEND ERRORS"
+
+  echo "── Step 1/4: register a throwaway user while the DB is still up (need a real token) ──"
+  pf_frontend
+  REGISTER_RESP=$(curl -s -X POST http://localhost:8080/api/auth/register \
+    -H "Content-Type: application/json" \
+    -d "{\"email\":\"$CHAOS_USER_EMAIL\",\"password\":\"$CHAOS_USER_PASS\",\"firstName\":\"Chaos\",\"lastName\":\"Demo\"}")
+  TOKEN=$(echo "$REGISTER_RESP" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
+
+  if [ -z "$TOKEN" ]; then
+    echo "  Already registered — logging in instead."
+    LOGIN_RESP=$(curl -s -X POST http://localhost:8080/api/auth/login \
+      -H "Content-Type: application/json" \
+      -d "{\"email\":\"$CHAOS_USER_EMAIL\",\"password\":\"$CHAOS_USER_PASS\"}")
+    TOKEN=$(echo "$LOGIN_RESP" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
+  fi
+
+  if [ -z "$TOKEN" ]; then
+    echo "  Could not get a token — continuing with unauthenticated traffic only."
+  else
+    echo "  Got a token (${#TOKEN} chars)."
+  fi
+
+  echo ""
+  echo "── Step 2/4: tail backend logs in the background (Ctrl-C stops the whole script) ──"
+  kubectl logs -n $NS -l app=backend -f --tail=0 --prefix &
+  LOGS_PID=$!
+
+  echo ""
+  echo "── Step 3/4: crash the database ──"
+  kubectl scale statefulset postgres --replicas=0 -n $NS
+  echo "  Waiting for the backend readinessProbe to notice..."
+  sleep 8
+
+  echo ""
+  echo "── Step 4/4: fire mixed traffic through the real frontend Service ──"
+
+  echo "  /health — nginx doesn't proxy this path (only /api/ is proxied), so"
+  echo "  this one goes straight to the backend, same as the other scenarios:"
+  pf
+  curl -s http://localhost:4000/health -w "  → HTTP %{http_code}\n" -o /dev/null
+  kill $PF_PID 2>/dev/null
+  unset PF_PID
+
+  echo ""
+  echo "  Protected endpoint, NO token (genuine 401, unrelated to the DB):"
+  curl -s http://localhost:8080/api/accounts -w "  → HTTP %{http_code}\n" -o /dev/null
+
+  echo ""
+  echo "  Protected endpoint, WITH token (401 — this one IS the DB outage, mislabeled):"
+  for ep in /api/accounts /api/cards /api/transactions; do
+    curl -s http://localhost:8080$ep -H "Authorization: Bearer $TOKEN" \
+      -w "    $ep → HTTP %{http_code}\n" -o /dev/null
+  done
+
+  echo ""
+  echo "  Nonexistent path (genuine 404, Express's default handler):"
+  curl -s http://localhost:8080/api/this-route-does-not-exist \
+    -w "  → HTTP %{http_code}\n" -o /dev/null
+
+  echo ""
+  echo "  Repeating the authenticated hits a few more times for a visible spike..."
+  for i in $(seq 1 15); do
+    curl -s http://localhost:8080/api/transactions -H "Authorization: Bearer $TOKEN" \
+      -w "[$i] HTTP %{http_code}\n" -o /dev/null &
+  done
+  wait
+
+  kill $LOGS_PID 2>/dev/null
+
+  echo ""
+  echo "Restore:"
+  echo "  kubectl scale statefulset postgres --replicas=1 -n $NS"
+  echo "  (or: $0 reset)"
+}
+
 # ── Reset Everything ──────────────────────────────────────────────────────────
 reset_all() {
   header "RESET ALL CHAOS"
@@ -220,9 +324,10 @@ case "${1:-}" in
   oom)               scenario_oom ;;
   kill-db)           scenario_kill_db ;;
   network-partition) scenario_network_partition ;;
+  cascade)           scenario_cascade ;;
   reset)             reset_all ;;
   *)
-    echo "Usage: $0 {status|disk-full|pool-exhaustion|oom|kill-db|network-partition|reset}"
+    echo "Usage: $0 {status|disk-full|pool-exhaustion|oom|kill-db|network-partition|cascade|reset}"
     echo ""
     echo "Scenarios:"
     echo "  status            — check pod/service/PVC status + backend health"
@@ -231,6 +336,8 @@ case "${1:-}" in
     echo "  oom               — OOMKill backend pod → CrashLoopBackOff → 502"
     echo "  kill-db           — scale postgres to 0 → ECONNREFUSED → 503"
     echo "  network-partition — NetworkPolicy blocks DB → connection timeout → 503"
+    echo "  cascade           — ONE command: DB crash → backend log errors →"
+    echo "                      real frontend-Service traffic (401/404/503 mix)"
     echo "  reset             — restore all services to normal"
     ;;
 esac
