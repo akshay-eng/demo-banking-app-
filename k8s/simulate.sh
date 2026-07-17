@@ -395,8 +395,23 @@ reset_all() {
     -c "DELETE FROM chaos_filler; VACUUM FULL;" 2>/dev/null || true
   echo "Reset complete. Waiting for pods to be ready..."
   kubectl wait --for=condition=ready pod -l app=backend -n $NS --timeout=120s
-  kubectl wait --for=condition=ready pod -l app=postgres -n $NS --timeout=60s
-  echo "All services restored."
+  backend_ok=$?
+  # 150s, not 60s — recovering FROM a crash loop takes longer than a fresh
+  # start: Kubernetes' exponential backoff from the prior CrashLoopBackOff
+  # is often still counting up before the corrected pod is even attempted.
+  kubectl wait --for=condition=ready pod -l app=postgres -n $NS --timeout=150s
+  postgres_ok=$?
+
+  if [ $backend_ok -eq 0 ] && [ $postgres_ok -eq 0 ]; then
+    echo "All services restored."
+  else
+    echo "⚠ Reset commands were issued, but not everything confirmed ready in time:"
+    [ $backend_ok -ne 0 ]  && echo "  - backend did not reach Ready"
+    [ $postgres_ok -ne 0 ] && echo "  - postgres did not reach Ready"
+    echo "  Check manually: kubectl get pods -n $NS"
+    echo "  (it may just need more time — recheck in ~30s before assuming failure)"
+    return 1
+  fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
