@@ -7,12 +7,35 @@
 NS="banking-demo"
 BACKEND_SVC="backend:4000"
 
+# Confirms a local port is actually talking to OUR pod, not some unrelated
+# service that happened to already be listening there. kubectl port-forward
+# fails silently if the local port is taken — it still launches a process
+# and returns a PID, it just never binds, so curl ends up hitting whatever
+# else was already on that port. This checks for a fingerprint unique to our
+# own app before any scenario is allowed to trust the tunnel.
+wait_for_port() {
+  local port=$1 path=$2 fingerprint=$3 label=$4
+  for i in $(seq 1 10); do
+    body=$(curl -s --max-time 2 "http://localhost:${port}${path}" 2>/dev/null)
+    if echo "$body" | grep -q "$fingerprint"; then
+      echo "  $label tunnel confirmed (localhost:$port)."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  ✗ $label tunnel on localhost:$port did NOT respond as expected."
+  echo "    Something else may already be listening on that port on this node."
+  echo "    Check with: ss -tlnp | grep :$port   (or: sudo lsof -i :$port)"
+  return 1
+}
+
 # Port-forward helper (run in background)
 pf() {
-  kubectl port-forward -n $NS svc/backend 4000:4000 &>/dev/null &
+  kubectl port-forward -n $NS svc/backend 4000:4000 &>/tmp/pf-backend.log &
   PF_PID=$!
   sleep 2
   echo "Port-forward active (PID $PF_PID)"
+  wait_for_port 4000 /health "DemoBanking API" "Backend"
 }
 
 cleanup_pf() {
@@ -23,12 +46,14 @@ cleanup_pf() {
 trap cleanup_pf EXIT
 
 # Port-forward the frontend Service (nginx) — separate from pf() above, which
-# talks to the backend directly and bypasses nginx entirely.
+# talks to the backend directly and bypasses nginx entirely. Uses 18080
+# rather than the much more commonly-already-taken 8080.
 pf_frontend() {
-  kubectl port-forward -n $NS svc/frontend 8080:80 &>/dev/null &
+  kubectl port-forward -n $NS svc/frontend 18080:80 &>/tmp/pf-frontend.log &
   PF_FE_PID=$!
   sleep 2
   echo "Frontend port-forward active (PID $PF_FE_PID)"
+  wait_for_port 18080 / "DemoBank" "Frontend"
 }
 
 header() {
@@ -228,21 +253,31 @@ scenario_cascade() {
 
   echo "── Step 1/4: register a throwaway user while the DB is still up (need a real token) ──"
   pf_frontend
-  REGISTER_RESP=$(curl -s -X POST http://localhost:8080/api/auth/register \
+  if [ $? -ne 0 ]; then
+    echo ""
+    echo "Aborting — traffic sent to an unverified tunnel would be meaningless."
+    echo "See /tmp/pf-frontend.log for the raw kubectl port-forward output."
+    cleanup_pf
+    return 1
+  fi
+
+  REGISTER_RESP=$(curl -s -X POST http://localhost:18080/api/auth/register \
     -H "Content-Type: application/json" \
     -d "{\"email\":\"$CHAOS_USER_EMAIL\",\"password\":\"$CHAOS_USER_PASS\",\"firstName\":\"Chaos\",\"lastName\":\"Demo\"}")
   TOKEN=$(echo "$REGISTER_RESP" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
 
   if [ -z "$TOKEN" ]; then
     echo "  Already registered — logging in instead."
-    LOGIN_RESP=$(curl -s -X POST http://localhost:8080/api/auth/login \
+    LOGIN_RESP=$(curl -s -X POST http://localhost:18080/api/auth/login \
       -H "Content-Type: application/json" \
       -d "{\"email\":\"$CHAOS_USER_EMAIL\",\"password\":\"$CHAOS_USER_PASS\"}")
     TOKEN=$(echo "$LOGIN_RESP" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
   fi
 
   if [ -z "$TOKEN" ]; then
-    echo "  Could not get a token — continuing with unauthenticated traffic only."
+    echo "  Could not get a token even via login — raw response was:"
+    echo "  $LOGIN_RESP"
+    echo "  Continuing with unauthenticated traffic only."
   else
     echo "  Got a token (${#TOKEN} chars)."
   fi
@@ -264,30 +299,34 @@ scenario_cascade() {
   echo "  /health — nginx doesn't proxy this path (only /api/ is proxied), so"
   echo "  this one goes straight to the backend, same as the other scenarios:"
   pf
-  curl -s http://localhost:4000/health -w "  → HTTP %{http_code}\n" -o /dev/null
+  if [ $? -eq 0 ]; then
+    curl -s http://localhost:4000/health -w "  → HTTP %{http_code}\n" -o /dev/null
+  else
+    echo "  Skipped — backend tunnel didn't verify. See /tmp/pf-backend.log."
+  fi
   kill $PF_PID 2>/dev/null
   unset PF_PID
 
   echo ""
   echo "  Protected endpoint, NO token (genuine 401, unrelated to the DB):"
-  curl -s http://localhost:8080/api/accounts -w "  → HTTP %{http_code}\n" -o /dev/null
+  curl -s http://localhost:18080/api/accounts -w "  → HTTP %{http_code}\n" -o /dev/null
 
   echo ""
   echo "  Protected endpoint, WITH token (401 — this one IS the DB outage, mislabeled):"
   for ep in /api/accounts /api/cards /api/transactions; do
-    curl -s http://localhost:8080$ep -H "Authorization: Bearer $TOKEN" \
+    curl -s http://localhost:18080$ep -H "Authorization: Bearer $TOKEN" \
       -w "    $ep → HTTP %{http_code}\n" -o /dev/null
   done
 
   echo ""
   echo "  Nonexistent path (genuine 404, Express's default handler):"
-  curl -s http://localhost:8080/api/this-route-does-not-exist \
+  curl -s http://localhost:18080/api/this-route-does-not-exist \
     -w "  → HTTP %{http_code}\n" -o /dev/null
 
   echo ""
   echo "  Repeating the authenticated hits a few more times for a visible spike..."
   for i in $(seq 1 15); do
-    curl -s http://localhost:8080/api/transactions -H "Authorization: Bearer $TOKEN" \
+    curl -s http://localhost:18080/api/transactions -H "Authorization: Bearer $TOKEN" \
       -w "[$i] HTTP %{http_code}\n" -o /dev/null &
   done
   wait
