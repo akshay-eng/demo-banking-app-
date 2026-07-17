@@ -23,8 +23,13 @@ spec:
       containers:
         - name: frontend
           # Build: docker build -t demobanking-frontend ./frontend
-          image: demobanking-frontend:latest
-          imagePullPolicy: IfNotPresent
+          # Push:  docker tag demobanking-frontend:latest ak3hay/demobanking-frontend:latest
+          #        docker push ak3hay/demobanking-frontend:latest
+          image: ak3hay/demobanking-frontend:latest
+          # Always, not IfNotPresent — this now pulls from a real registry
+          # tagged :latest, so a stale local cache must never win over a
+          # fresh push. IfNotPresent silently keeps old content otherwise.
+          imagePullPolicy: Always
           ports:
             - containerPort: 80
               name: http
