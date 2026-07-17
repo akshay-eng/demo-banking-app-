@@ -1,0 +1,118 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 6 — POSTGRES OOM KILL → CRASHLOOPBACKOFF
+# ──────────────────────────────────────────────────────────────────────────────
+# What happens:
+#   Patches the postgres StatefulSet with a 16Mi memory limit. The ConfigMap's
+#   own postgresql.conf already sets shared_buffers = 32MB, so Postgres can't
+#   even finish starting up before the kernel cgroup kills it — no chaos
+#   endpoint or trigger step needed, unlike the backend OOM scenario. K8s
+#   restarts it, it OOMKills again immediately, repeat → CrashLoopBackOff.
+#
+# Chain of failures:
+#   Postgres pod → OOMKilled (exit 137) within seconds of every start attempt
+#   K8s          → pod restarts → CrashLoopBackOff, restart count climbing
+#   Backend      → every DB-dependent request fails; auth middleware's catch
+#                  block reports these as 401 "Invalid or expired token"
+#                  rather than 500 — same nuance as the scale-to-zero scenario.
+#                  Non-auth DB errors (chaos routes, raw queries) surface as
+#                  genuine 500s.
+#   Frontend     → whatever the browser is doing at the time reflects the
+#                  above — mostly 401/500 through nginx's /api/ proxy.
+#
+# Observable in Instana:
+#   • K8s: postgres pod restart count spikes, OOMKilled events, CrashLoopBackOff
+#   • Backend: error rate + call-volume anomalies on banking-backend
+#   • This is a DIFFERENT signature than scale-to-zero: real restart-count
+#     and OOMKilled K8s events exist here; scale-to-zero has neither (it's
+#     just an absence, not a crash), so this is the one to use if your Smart
+#     Alert / Automation Rule is specifically watching for CrashLoopBackOff.
+#
+# Step 1 — Apply the tight memory limit (this alone triggers the crash loop):
+#   kubectl apply -f k8s/errors/06-postgres-oom.yaml
+# Step 2 — Watch the crash loop:
+#   kubectl get pods -n banking-demo -l app=postgres -w
+# Cleanup — restore normal limits:
+#   kubectl apply -f k8s/postgres/statefulset.yaml
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: banking-demo
+  labels:
+    app: postgres
+    tier: database
+    chaos-scenario: oom
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        tier: database
+      annotations:
+        instana.io/service-name: "banking-postgres"
+        instana.io/custom-tags: "tier=database,env=demo,chaos=oom"
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 100m
+              memory: 16Mi
+            limits:
+              cpu: 500m
+              memory: 16Mi   # ← Deliberately below the 32MB shared_buffers
+                              #   setting in postgresql.conf — OOMKill guaranteed
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+          # No probes here on purpose — the container dies before any probe's
+          # initialDelaySeconds would even elapse; they'd never fire anyway.
+      volumes:
+        - name: postgres-config
+          configMap:
+            name: banking-config
+            items:
+              - key: postgresql.conf
+                path: postgresql.conf
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app: postgres
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 512Mi

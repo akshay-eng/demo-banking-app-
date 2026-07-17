@@ -208,6 +208,32 @@ scenario_kill_db() {
   echo "  kubectl scale statefulset postgres --replicas=1 -n $NS"
 }
 
+# ── SCENARIO 4b: Postgres OOM Kill → real CrashLoopBackOff ────────────────────
+# Unlike scenario_kill_db (clean scale-to-zero, no restart count, no OOM
+# event), this reproduces an actual "container ran out of memory" failure —
+# the signature Instana shows as OOMKilled + climbing restart count, not
+# just an absence. No trigger step needed: the tight limit alone does it.
+scenario_postgres_oom() {
+  header "SCENARIO 4b: POSTGRES OOM KILL → CRASHLOOPBACKOFF"
+  echo "Applying tight memory limit to postgres (16Mi, below its own"
+  echo "postgresql.conf shared_buffers=32MB setting)..."
+  kubectl apply -f "$(dirname "$0")/errors/06-postgres-oom.yaml"
+
+  echo ""
+  echo "Watching pod state (look for OOMKilled → CrashLoopBackOff):"
+  kubectl get pods -n $NS -l app=postgres -w &
+  sleep 30
+  kill %1 2>/dev/null
+
+  echo ""
+  echo "Pod describe (shows OOMKilled events):"
+  kubectl describe pods -n $NS -l app=postgres | grep -A5 "OOM\|Exit Code\|Restart\|Reason"
+
+  echo ""
+  echo "Cleanup (restore normal limits):"
+  echo "  kubectl apply -f $(dirname "$0")/postgres/statefulset.yaml"
+}
+
 # ── SCENARIO 5: Network Partition ─────────────────────────────────────────────
 # Expected Instana alerts:
 #   ▸ Backend outbound connection timeouts (not refused — dropped)
@@ -249,7 +275,8 @@ CHAOS_USER_EMAIL="chaos-demo@example.com"
 CHAOS_USER_PASS="ChaosDemo123!"
 
 scenario_cascade() {
-  header "SCENARIO 6: FULL CASCADE — DB → BACKEND LOGS → FRONTEND ERRORS"
+  local mode="${1:-scale}"   # scale (clean absence) or oom (real CrashLoopBackOff)
+  header "SCENARIO 6: FULL CASCADE — DB → BACKEND LOGS → FRONTEND ERRORS ($mode)"
 
   echo "── Step 1/4: register a throwaway user while the DB is still up (need a real token) ──"
   pf_frontend
@@ -288,10 +315,19 @@ scenario_cascade() {
   LOGS_PID=$!
 
   echo ""
-  echo "── Step 3/4: crash the database ──"
-  kubectl scale statefulset postgres --replicas=0 -n $NS
-  echo "  Waiting for the backend readinessProbe to notice..."
-  sleep 8
+  if [ "$mode" = "oom" ]; then
+    echo "── Step 3/4: crash the database (OOM → real CrashLoopBackOff) ──"
+    kubectl apply -f "$(dirname "$0")/errors/06-postgres-oom.yaml"
+    echo "  Waiting for the OOM/restart cycle to kick in..."
+    sleep 12
+    echo "  Postgres pod state right now:"
+    kubectl get pods -n $NS -l app=postgres
+  else
+    echo "── Step 3/4: crash the database (clean scale-to-zero) ──"
+    kubectl scale statefulset postgres --replicas=0 -n $NS
+    echo "  Waiting for the backend readinessProbe to notice..."
+    sleep 8
+  fi
 
   echo ""
   echo "── Step 4/4: fire mixed traffic through the real frontend Service ──"
@@ -335,7 +371,11 @@ scenario_cascade() {
 
   echo ""
   echo "Restore:"
-  echo "  kubectl scale statefulset postgres --replicas=1 -n $NS"
+  if [ "$mode" = "oom" ]; then
+    echo "  kubectl apply -f $(dirname "$0")/postgres/statefulset.yaml"
+  else
+    echo "  kubectl scale statefulset postgres --replicas=1 -n $NS"
+  fi
   echo "  (or: $0 reset)"
 }
 
@@ -344,6 +384,10 @@ reset_all() {
   header "RESET ALL CHAOS"
   kubectl delete job fill-disk-job load-spike-job -n $NS 2>/dev/null || true
   kubectl delete networkpolicy block-postgres-ingress -n $NS 2>/dev/null || true
+  # Restores postgres's real resource limits too, not just replica count —
+  # postgres-oom / cascade oom patch the StatefulSet spec itself, which a
+  # bare `scale` never touches, so the crash loop would otherwise continue.
+  kubectl apply -f "$(dirname "$0")/postgres/statefulset.yaml"
   kubectl scale statefulset postgres --replicas=1 -n $NS
   kubectl apply -f "$(dirname "$0")/backend/deployment.yaml"
   pf
@@ -362,11 +406,13 @@ case "${1:-}" in
   pool-exhaustion)   scenario_pool_exhaustion ;;
   oom)               scenario_oom ;;
   kill-db)           scenario_kill_db ;;
+  postgres-oom)      scenario_postgres_oom ;;
   network-partition) scenario_network_partition ;;
-  cascade)           scenario_cascade ;;
+  cascade)           scenario_cascade scale ;;
+  cascade-oom)       scenario_cascade oom ;;
   reset)             reset_all ;;
   *)
-    echo "Usage: $0 {status|disk-full|pool-exhaustion|oom|kill-db|network-partition|cascade|reset}"
+    echo "Usage: $0 {status|disk-full|pool-exhaustion|oom|kill-db|postgres-oom|network-partition|cascade|cascade-oom|reset}"
     echo ""
     echo "Scenarios:"
     echo "  status            — check pod/service/PVC status + backend health"
@@ -374,9 +420,15 @@ case "${1:-}" in
     echo "  pool-exhaustion   — exhaust DB connection pool → Prisma P2024 → 503"
     echo "  oom               — OOMKill backend pod → CrashLoopBackOff → 502"
     echo "  kill-db           — scale postgres to 0 → ECONNREFUSED → 503"
+    echo "                      (clean absence — no restart count, no OOM event)"
+    echo "  postgres-oom      — OOMKill postgres pod → real CrashLoopBackOff"
+    echo "                      (restart count + OOMKilled events, distinct signature)"
     echo "  network-partition — NetworkPolicy blocks DB → connection timeout → 503"
-    echo "  cascade           — ONE command: DB crash → backend log errors →"
-    echo "                      real frontend-Service traffic (401/404/503 mix)"
-    echo "  reset             — restore all services to normal"
+    echo "  cascade           — ONE command: DB scale-to-zero → backend log errors →"
+    echo "                      real frontend-Service traffic (401/404/500 mix)"
+    echo "  cascade-oom       — same as cascade, but DB dies via OOM/CrashLoopBackOff"
+    echo "                      instead of scale-to-zero"
+    echo "  reset             — restore all services to normal (also undoes any"
+    echo "                      OOM memory-limit patches, not just replica count)"
     ;;
 esac
