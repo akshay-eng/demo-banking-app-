@@ -45,6 +45,38 @@ cleanup_pf() {
 
 trap cleanup_pf EXIT
 
+restore_postgres() {
+  echo ""
+  echo "→ Restoring postgres to its normal spec..."
+  kubectl apply -f "$(dirname "$0")/postgres/statefulset.yaml" >/dev/null 2>&1
+  # Force-replace the pod: a plain apply often won't dislodge a pod stuck in
+  # CrashLoopBackOff (its restart backoff timer blocks the rolling update).
+  kubectl delete pod postgres-0 -n "$NS" --force --grace-period=0 >/dev/null 2>&1
+  kubectl wait --for=condition=ready pod -l app=postgres -n "$NS" --timeout=120s >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    echo "  postgres restored and Ready."
+  else
+    echo "  ⚠ postgres not Ready yet — check: kubectl get pods -n $NS -l app=postgres"
+  fi
+}
+
+# Keeps the DB in its broken state for as long as you're observing alerts /
+# ServiceNow, then restores on your signal — so a forgotten run can't leave
+# postgres crash-looping, but the outage still lasts your whole observation
+# window (auto-restoring on script exit would heal it in ~2 min, too soon).
+hold_then_restore() {
+  trap 'restore_postgres; exit 0' INT   # Ctrl+C restores too
+  echo ""
+  echo "════════════════════════════════════════════════════════"
+  echo "  postgres is now in its failed state."
+  echo "  Go watch your Instana alerts fire and your ServiceNow ticket."
+  echo "  ➜ Press ENTER here when done to restore postgres (or Ctrl+C)."
+  echo "════════════════════════════════════════════════════════"
+  read -r _
+  trap - INT
+  restore_postgres
+}
+
 # Port-forward the frontend Service (nginx) — separate from pf() above, which
 # talks to the backend directly and bypasses nginx entirely. Uses 18080
 # rather than the much more commonly-already-taken 8080.
@@ -229,9 +261,7 @@ scenario_postgres_oom() {
   echo "Pod describe (shows OOMKilled events):"
   kubectl describe pods -n $NS -l app=postgres | grep -A5 "OOM\|Exit Code\|Restart\|Reason"
 
-  echo ""
-  echo "Cleanup (restore normal limits):"
-  echo "  kubectl apply -f $(dirname "$0")/postgres/statefulset.yaml"
+  hold_then_restore
 }
 
 # ── SCENARIO 5: Network Partition ─────────────────────────────────────────────
@@ -369,14 +399,7 @@ scenario_cascade() {
 
   kill $LOGS_PID 2>/dev/null
 
-  echo ""
-  echo "Restore:"
-  if [ "$mode" = "oom" ]; then
-    echo "  kubectl apply -f $(dirname "$0")/postgres/statefulset.yaml"
-  else
-    echo "  kubectl scale statefulset postgres --replicas=1 -n $NS"
-  fi
-  echo "  (or: $0 reset)"
+  hold_then_restore
 }
 
 # ── Reset Everything ──────────────────────────────────────────────────────────
