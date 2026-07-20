@@ -60,12 +60,20 @@ restore_postgres() {
   fi
 }
 
+# Call this the MOMENT postgres is broken, so ANY interrupt from then on —
+# Ctrl+C during traffic, terminal close, error — restores the DB. Without
+# this, an interrupt before hold_then_restore() left postgres crash-looping
+# (that's how it once sat broken for 13h overnight).
+arm_pg_restore() {
+  trap 'echo; restore_postgres; exit 130' INT TERM
+}
+
 # Keeps the DB in its broken state for as long as you're observing alerts /
 # ServiceNow, then restores on your signal — so a forgotten run can't leave
 # postgres crash-looping, but the outage still lasts your whole observation
 # window (auto-restoring on script exit would heal it in ~2 min, too soon).
 hold_then_restore() {
-  trap 'restore_postgres; exit 0' INT   # Ctrl+C restores too
+  arm_pg_restore   # idempotent — safe even if already armed at break time
   echo ""
   echo "════════════════════════════════════════════════════════"
   echo "  postgres is now in its failed state."
@@ -73,7 +81,7 @@ hold_then_restore() {
   echo "  ➜ Press ENTER here when done to restore postgres (or Ctrl+C)."
   echo "════════════════════════════════════════════════════════"
   read -r _
-  trap - INT
+  trap - INT TERM
   restore_postgres
 }
 
@@ -250,6 +258,7 @@ scenario_postgres_oom() {
   echo "Applying tight memory limit to postgres (16Mi, below its own"
   echo "postgresql.conf shared_buffers=32MB setting)..."
   kubectl apply -f "$(dirname "$0")/errors/06-postgres-oom.yaml"
+  arm_pg_restore   # from here on, any interrupt restores postgres
 
   echo ""
   echo "Watching pod state (look for OOMKilled → CrashLoopBackOff):"
@@ -348,6 +357,7 @@ scenario_cascade() {
   if [ "$mode" = "oom" ]; then
     echo "── Step 3/4: crash the database (OOM → real CrashLoopBackOff) ──"
     kubectl apply -f "$(dirname "$0")/errors/06-postgres-oom.yaml"
+    arm_pg_restore   # from here on, any interrupt restores postgres
     echo "  Waiting for the OOM/restart cycle to kick in..."
     sleep 12
     echo "  Postgres pod state right now:"
@@ -355,6 +365,7 @@ scenario_cascade() {
   else
     echo "── Step 3/4: crash the database (clean scale-to-zero) ──"
     kubectl scale statefulset postgres --replicas=0 -n $NS
+    arm_pg_restore   # from here on, any interrupt restores postgres
     echo "  Waiting for the backend readinessProbe to notice..."
     sleep 8
   fi
